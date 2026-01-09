@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 import sqlite3
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -237,6 +237,81 @@ def expected_etf_price(model: ModelResult, ndx_level: float, ndx_range_pct: floa
 
 
 # ====== Commands ======
+@dataclass
+class ShellState:
+    models: Optional[Dict[str, ModelResult]] = None
+
+
+SHELL_HELP_TEXT = """
+Commands:
+  update             価格データを更新
+  ndx <value>        NDXを入力して想定レンジ表示（例: ndx 25653.9）
+  latest             最新日のTrading Signalを再表示
+  help               ヘルプ
+  quit / exit / q    終了
+
+Tips:
+  ただ数値だけ入れた場合も NDX として扱います（例: 25653.9）
+"""
+
+
+def normalize_tokens(tokens: List[str]) -> List[str]:
+    joined = " ".join(tokens)
+    return joined.replace(",", " ").split()
+
+
+def is_number(text: str) -> bool:
+    try:
+        float(text)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_command_sequence(raw_tokens: List[str]) -> List[List[str]]:
+    tokens = normalize_tokens(raw_tokens)
+    commands: List[List[str]] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i].lower()
+        if token in {"q", "quit", "exit"}:
+            commands.append(["quit"])
+            i += 1
+            continue
+        if token in {"update", "shell", "latest", "help"}:
+            commands.append([token])
+            i += 1
+            continue
+        if token == "ndx":
+            if i + 1 >= len(tokens):
+                raise ValueError("ndx の値がありません。")
+            commands.append(["ndx", tokens[i + 1]])
+            i += 2
+            continue
+        if is_number(token):
+            commands.append(["ndx", token])
+            i += 1
+            continue
+        raise ValueError(f"不明なコマンド: {tokens[i]}")
+    return commands
+
+
+def parse_ndx_value(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ValueError("入力例: ndx 25653.9  /  25653.9  / latest / update / quit") from exc
+    if value <= 0:
+        raise ValueError("入力例: ndx 25653.9  /  25653.9  / latest / update / quit")
+    return value
+
+
+def ensure_models(conn: sqlite3.Connection, state: ShellState) -> Dict[str, ModelResult]:
+    if state.models is None:
+        state.models = build_models(conn)
+    return state.models
+
+
 def cmd_update(conn: sqlite3.Connection) -> None:
     print("Downloading daily OHLC from Stooq ...")
     ndx = fetch_stooq_daily(SYMBOL_NDX)
@@ -289,74 +364,96 @@ def print_mapping_for_ndx(models: Dict[str, ModelResult], ndx_level: float) -> N
         print(f"(参考) 中央値レンジ ±{m.median_range_pct*100:.2f}%  exp={exp_px:.2f}  -1σ={m1:.2f}  +1σ={p1:.2f}")
 
 
-def cmd_shell(conn: sqlite3.Connection) -> None:
-    models = build_models(conn)
+def run_command(conn: sqlite3.Connection, state: ShellState, cmd: str, args: List[str], *, interactive: bool) -> bool:
+    if cmd == "quit":
+        return False
+    if cmd == "help":
+        print(SHELL_HELP_TEXT.strip())
+        return True
+    if cmd == "update":
+        cmd_update(conn)
+        state.models = None
+        return True
+    if cmd == "latest":
+        models = ensure_models(conn, state)
+        print_latest(models)
+        return True
+    if cmd == "ndx":
+        if not args:
+            raise ValueError("ndx の値がありません。")
+        ndx_level = parse_ndx_value(args[0])
+        models = ensure_models(conn, state)
+        print_mapping_for_ndx(models, ndx_level)
+        return True
+    if cmd == "shell":
+        if interactive:
+            print("すでにシェルです。")
+            return True
+        run_shell(conn, state)
+        return True
+    raise ValueError(f"不明なコマンド: {cmd}")
+
+
+def run_shell(conn: sqlite3.Connection, state: ShellState) -> None:
+    models = ensure_models(conn, state)
     print("\n=== Model Ready (last ~3 months) ===")
     for name, m in models.items():
         print(f"[{name}] n={m.n}  a={m.a:.6f}  b={m.b:.6f}  c={m.c:.6f}  sigma={m.sigma:.6f}")
 
     print_latest(models)
-
-    help_text = """
-Commands:
-  ndx <value>        NDXを入力して想定レンジ表示（例: ndx 25653.9）
-  latest             最新日のTrading Signalを再表示
-  help               ヘルプ
-  quit / exit / q    終了
-
-Tips:
-  ただ数値だけ入れた場合も NDX として扱います（例: 25653.9）
-"""
-    print(help_text.strip())
+    print(SHELL_HELP_TEXT.strip())
 
     while True:
-        s = input("\n> ").strip()
+        try:
+            s = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            return
         if not s:
             continue
-        low = s.lower()
-
-        if low in {"q", "quit", "exit"}:
-            break
-        if low == "help":
-            print(help_text.strip())
-            continue
-        if low == "latest":
-            models = build_models(conn)  # 更新後に係数が変わる可能性があるので再計算
-            print_latest(models)
-            continue
-
-        # parse "ndx 12345" or just "12345"
-        parts = s.replace(",", " ").split()
-        if parts[0].lower() == "ndx":
-            parts = parts[1:]
-
         try:
-            ndx_level = float(parts[0])
-            if ndx_level <= 0:
-                raise ValueError
-        except Exception:
-            print("入力例: ndx 25653.9  /  25653.9  / latest / quit")
+            commands = parse_command_sequence([s])
+        except ValueError as exc:
+            print(str(exc))
             continue
 
-        models = build_models(conn)
-        print_mapping_for_ndx(models, ndx_level)
+        for command in commands:
+            try:
+                should_continue = run_command(conn, state, command[0], command[1:], interactive=True)
+            except ValueError as exc:
+                print(str(exc))
+                should_continue = True
+            if not should_continue:
+                return
+
+
+def cmd_shell(conn: sqlite3.Connection) -> None:
+    state = ShellState()
+    run_shell(conn, state)
 
 
 # ====== main ======
 def main(argv: List[str]) -> int:
-    args = [a.lower() for a in argv[1:]]
-    do_update = "update" in args
-    do_shell = ("shell" in args) or (len(args) == 0)  # デフォルトは shell
+    try:
+        commands = parse_command_sequence(argv[1:])
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    if not commands:
+        commands = [["shell"]]
 
     with sqlite3.connect(DB_PATH) as conn:
         ensure_db(conn)
 
-        if do_update:
-            cmd_update(conn)
-
-        if do_shell:
-            cmd_shell(conn)
-            return 0
+        state = ShellState()
+        for command in commands:
+            try:
+                should_continue = run_command(conn, state, command[0], command[1:], interactive=False)
+            except ValueError as exc:
+                print(str(exc))
+                return 1
+            if not should_continue:
+                break
 
     return 0
 
